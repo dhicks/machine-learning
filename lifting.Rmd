@@ -1,0 +1,367 @@
+
+---
+title: 'Machine Learning Course Project'
+output: html_document
+---
+
+# Preliminaries
+
+We first load the packages that we will require, then log the date and time and the scripting environment.  
+
+```{r packages}
+library(caret)                    # machine learning models
+library(doParallel)               # parallel processing
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+library(ggdendro)                 # dendrogram of predictors
+#library(rattle)                  # pretty decision tree
+
+library(plyr)                     # loaded here to avoid a conflict below
+library(dplyr)                    # for manipulating dataframes
+library(reshape2)                 # for manipulating dataframes
+```
+
+```{r timestamp, results='hold'}
+date()
+sessionInfo()
+```
+```
+
+```{r read data}
+# Download dataset
+training_file <- 'train.csv'
+if (!file.exists(training_file)) {
+	download.file(
+		'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv',
+		training_file, 
+		'curl')
+}
+# Read the csv
+train_data_full <- read.csv(training_file, 
+							na.strings = c('#DIV/0!', 'NA')) %>% 
+	# Convert to a dplyr data frame tbl for printing purposes
+	tbl_df
+dim(train_data_full)
+```
+
+
+
+# Data Codebook
+
+From the source website:  
+
+> Six young health[y] participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+> Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes. 
+
+Primary data come from 4 sensors:  `arm`, `forearm`, `belt`, `dumbbell`.  
+
+38 dimensions are included for each sensor:  
+
+* `<axis>_<sensor>`, `<stat>_<axis>_<sensor>`, where
+    * `<axis>` is one of {`roll`, `pitch`, `yaw`}  
+		* NB 'pitch' is frequently misspelled as 'picth'; this is corrected in preprocessing
+	* `<stat>` is one of {`kurtosis`, `skewness`, `max`, `min`, `ampltitude`, `avg`, `stddev`, `var`}
+* `total_accel_<sensor>`, `var_total_accel_<sensor>`
+* `gyros_<sensor>_<dir>`, `accel_<sensor>_<dir>`, and `magnet_<sensor>_<dir>`, where 
+	* `<dir>` is one of {`x`, `y`, `z`}
+
+Total 152 primary dimensions.  The remaining dimensions are:  
+
+1. `X`:  row index
+2. `user_name`:  name of the user for that measurement
+3. `raw_timestamp_part_1`:  some sort of timecode
+4. `raw_timestamp_part_2`:  some sort of timecode
+5. `cvtd_timestamp`:  some sort of timecode
+6. `new_window`:  unknown; values are 'yes' and 'no'
+7. `num_window`:  unknown; values are integers, ranging from 1 to 864
+8. `classe`:  performance quality, one of A (correct) or B-E (incorrect, in various common ways)
+
+`X` and `user_name` are kept temporarily for EDA purposes.  `classe` is our endpoint.  The other dimensions are discarded.  
+
+```{r drop vars}
+# Drop dimensions that we don't want to use in the analysis
+train_data_full <- train_data_full %>% select(-one_of(
+    'raw_timestamp_part_1', 'raw_timestamp_part_2',
+	'cvtd_timestamp', 'new_window', 'num_window'))
+```
+
+
+# Preprocessing
+
+We first correct the misspellings of 'pitch'.  Note that this is done on the full dataset in order to keep feature names consistent.  
+
+```{r picth}
+# Fix misspellings of 'picth'
+names(train_data_full) <- sub('picth', 'pitch', names(train_data_full))
+```
+
+We then reserve 30% of the dataset for cross-validation.  
+
+```{r reserve test data}
+# Set a seed for replicability
+set.seed(12345)
+in_test <- createDataPartition(y = train_data_full$classe, p = 0.3, list=FALSE)
+training <- train_data_full %>% slice(-in_test)
+testing <- train_data_full %>% slice(in_test)
+n <- count(training) %>% as.integer
+```
+
+# Exploratory Data Analysis
+
+The data are ordered by `classe`, though not by user.  In addition, data from the users are spread over all five values of `classe`.  
+
+```{r classe by index}
+qplot(X, classe, data=training, color=user_name)
+```
+
+100 of the primary dimensions are nearly all NAs.  
+```{r high na}
+nas <- summarise_each(training, funs(sum(is.na(.))))
+na_cols <- nas[,which(nas/n > .90)] %>% names
+length(na_cols)
+```
+
+These NAs do not appear to be correlated with users or `classe`.  
+
+```{r}
+# High-NA columns appear to be roughly evenly split across user
+group_by(training, user_name) %>% summarize(sum(is.na(max_roll_belt)))
+# And classe
+group_by(training, classe) %>% summarize(sum(is.na(max_roll_belt)))
+```
+
+So we discard these high-NA dimensions, along with `X` and `user_name`.  
+
+```{r drop high na}
+# Drop high-NA columns
+training <- training %>% select(-one_of(na_cols, 'user_name', 'X'))
+```
+
+While this significantly reduces the dimensionality of the dataset, we still have 52 dimensions (plus the endpoint `classe`).  
+
+```{r}
+dim(training)
+```
+
+To consider whether further dimension reduction might be appropriate, we next construct a correlation heat map. Since we are interested in the magnitude of the correlation, we map its absolute value.  
+
+```{r feature heatmap}
+# Following http://www.sthda.com/english/wiki/ggplot2-quick-correlation-matrix-heatmap-r-software-and-data-visualization
+# Select everything except classe, calculate correlations, 
+# Take the absolute value
+feature_corr <- select(training, -classe) %>% cor %>% abs
+# Use melt to get the proper format for ggplot
+feature_heatmap <- feature_corr %>% melt
+ggplot(data = feature_heatmap, aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile() +
+    theme(axis.text.x = element_text(angle = 45, vjust=.5)) +
+    scale_fill_gradient(low='blue', high='white', name='Absolute\n Correlation') +
+	ggtitle('Feature correlation heatmap')
+```
+
+The heatmap indicates some correlations among dimensions.  For example, for a given `<sensor>`, the `magnet_<sensor>_<dir>` dimensions are correlated with each other, as are many of the `belt` dimensions.  Likewise, a cluster analysis suggests that some dimension reduction is possible.  
+
+```{r feature dendrogram}
+# Similar to the heatmap, only here we want 1-abs(correlation)
+# Pass through as.dist so that hclust knows how to interpret it
+feature_dist <- 1-feature_corr
+feature_tree <- feature_dist %>% as.dist %>% hclust
+# cutree needs the hclust version of the tree
+threshold <- .4
+feature_tree_groups <- cutree(feature_tree, h=threshold)
+# While ggplot needs the dendro_data version
+feature_tree <- feature_tree %>% as.dendrogram %>% dendro_data
+# Plot with ggplot
+ggplot(segment(feature_tree)) + 
+	geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+	geom_text(data=label(feature_tree), size=2,
+			  aes(label=label, x=x, y=-.05, 
+			  	color=as.factor(feature_tree_groups))) +
+	geom_hline(y=threshold, color='black') +
+	scale_color_discrete(guide=FALSE) +
+	ggtitle('Feature correlation dendrogram') +
+	coord_flip() + 
+	theme_dendro()
+```
+
+In an earlier version of this analysis, PCA was used to achieve further dimension reduction.  `prcomp` indicated that over 95% of the variance in the predictors could be captured by the first 9 principal components, which would be a significant reduction.  However, for reasons I don't understand, `caret` kept 32 principal components, for a modest reduction of dimension and a significant increase in computation time. (And, in the case of the decision tree model, a significant decrease in model quality.)  Thus, no further dimension reduction is used here.  
+
+
+# Model Construction and Evaluation
+
+For each modelling algorithm, we use 5-fold cross-validation, then test the resulting model against the reserved data.  
+
+```{r trcontrol}
+trcontrol <- trainControl(method='cv', number=5)
+```
+
+## $k$-nearest neighbor model
+
+Pre-processing is used to center and scale the data for this model.  
+
+```{r knn, cache=TRUE}
+# Set a seed to break ties
+set.seed(12345)
+# Start a timer
+knn_t0 <- proc.time()
+# Train the model
+knn_model <- train(classe ~ ., data = training, method = 'knn', 
+                   trControl = trcontrol, 
+                   preProcess = c('center', 'scale'))
+# Stop the timer
+knn_t1 <- proc.time()
+knn_t <- knn_t1 - knn_t0
+```
+```{r knn output}
+# Model diagnostics and execution time
+knn_model
+knn_t
+# Generate predictions on the reserved test set
+knn_pred <- predict(knn_model, testing)
+confusionMatrix(knn_pred, testing$classe)
+qplot(knn_pred, testing$classe, 
+	  position = 'jitter', color=testing$classe, xlab = 'predicted classe',
+	  ylab = 'actual classe', main='kNN model')
+```
+
+This model runs relatively quickly (about 60 seconds on my laptop) and has an out-of-sample accuracy of approximately 96%.  
+
+## Decision tree model
+
+```{r tree, cache=TRUE}
+# The steps here work the same as those above, unless noted
+tree_t0 <- proc.time()
+tree_model <- train(classe ~ ., data=training, method='rpart', 
+					trControl = trcontrol)
+tree_t1 <- proc.time()
+tree_t <- tree_t1 - tree_t0
+```
+```{r tree output}
+tree_t
+tree_model
+# Generate a pretty plot using `rattle`
+#fancyRpartPlot(tree_model$finalModel)
+tree_pred <- predict(tree_model,testing)
+confusionMatrix(tree_pred,testing$classe)
+qplot(tree_pred, testing$classe, 
+	  position = 'jitter', color=testing$classe, xlab = 'predicted classe',
+	  ylab = 'actual classe', main='Tree model')
+```
+
+This model is very fast to train (about 10 seconds on my laptop), but has very low accuracy and overall is only somewhat better than chance.  Note that it misclassifies every D.  
+
+## Bag model
+
+```{r bag, cache=TRUE}
+# The steps here work the same as those above, unless noted
+bag_t0 <- proc.time()
+bag_model <- train(classe ~., data=training, method='treebag', 
+                   trControl = trcontrol)
+bag_t1 <- proc.time()
+bag_t <- bag_t1 - bag_t0
+```
+```{r bag output}
+bag_model
+bag_t
+bag_pred <- predict(bag_model, testing)
+confusionMatrix(bag_pred, testing$classe)
+qplot(bag_pred, testing$classe, 
+	  position = 'jitter', color=testing$classe, xlab = 'predicted classe',
+	  ylab = 'actual classe', main='Bag model')
+```
+
+This model takes a few minutes to run on my laptop (about 160 seconds), but offers a slight improvement in out-of-sample accuracy over the $k$-nearest-neighbors model.  
+
+`caret` provides `varImp`, which extracts information about the most important variables, scaled from 0 to 100. 
+
+```{r bag importance, cache=TRUE}
+varImp(bag_model) %>% plot(., top=10)
+```
+
+The most important variables in the bag model appear to be `roll_belt`, `yaw_belt`, `pitch_belt`, `pitch_forearm`, `roll_forearm`, `magnet_dumbbell_z`, and `magnet_dumbbell_y`.  
+
+## Random forest model
+
+```{r rf, cache=TRUE}
+rf_t0 <- proc.time()
+rf_model <- train(classe ~ ., data = training, method = 'rf', 
+                   trControl = trcontrol)
+rf_t1 <- proc.time()
+rf_t <- rf_t1 - rf_t0
+```
+```{r rf output}
+rf_model
+rf_t
+rf_pred <- predict(rf_model, testing)
+confusionMatrix(rf_pred, testing$classe)
+qplot(rf_pred, testing$classe, 
+	  position = 'jitter', color=testing$classe, xlab = 'predicted classe',
+	  ylab = 'actual classe', main = 'Random forest model')
+```
+
+This model is the slowest to train (taking 400 seconds on my latop), but offers approximately 99% out-of-sample accuracy.  Note that the predicted/actual plots for the bag and random forest models may be misleading:  the random forest has approximately half as many errors as the bag, but this is the difference between a 99% and 98% accuracy rate.  For many practical purposes that difference will be unimportant.  
+
+```{r rf importance}
+varImp(rf_model) %>% plot(., top=10)
+```
+
+The most important variables in the random forest model appear to be `roll_belt`, `pitch_forearm`, `yaw_belt`, `pitch_belt`, `magnet_dumbbell_y`, `roll_forearm`, and `magnet_dumbbell_z`.  Note that these are the same variables used in the bag model.  
+
+# Summary
+
+Both bagging and random forests are extremely accurate, with estimated 98% and 99% out-of-sample accuracy rates, respectively.  However, they are relatively computationally intensive.  In situations where scalability is more important and a small sacrifice in accuracy is acceptable, the $k$-nearest-neighbor model may be preferable.  This model has an estimated 96% out-of-sample accuracy rate.  
+
+
+# Test data
+
+The testing data are downloaded and 'picth' is corrected as with the training data.  After work began on htis section, only typos were corrected in the preceding sections.  
+
+```{r read test data}
+# Download dataset
+testing_file <- 'test.csv'
+if (!file.exists(testing_file)) {
+    download.file(
+		'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv',
+		testing_file, 
+		'curl')
+}
+# Read the csv
+test_data_full <- read.csv(testing_file, 
+							na.strings = c('#DIV/0!', 'NA'))
+# Fix misspellings of 'picth'
+names(test_data_full) <- sub('picth', 'pitch', names(test_data_full))
+```
+
+We use the random forest model.  
+
+```{r rf model test}
+test_pred <- predict(rf_model, test_data_full)
+```
+
+To generate the files for submission, we follow the approach suggested in the instructions.  
+
+```{r}
+# Define the function to generate the submission files
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+# Move to a subfolder
+original_wd <- getwd()
+predictions_folder <- paste(original_wd, '/predictions/', sep='')
+if (!file.exists(predictions_folder)) {
+    dir.create(predictions_folder)
+}
+setwd(predictions_folder)
+
+# Write the files
+pml_write_files(test_pred)
+
+# Move back up to the original working directory
+setwd(original_wd)
+```
